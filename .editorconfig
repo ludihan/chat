@@ -11,7 +11,7 @@ indent_size = 4
 charset = utf-8
 
 [*.go]
-indent_style = space
+indent_style = tab
 
 [*.js,*.json,*.tsx,*.jsx]
 indent_style = space
