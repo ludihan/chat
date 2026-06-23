@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 type channel struct {
@@ -20,6 +22,25 @@ type options struct {
 	serverImage *string
 	channels    []channel
 	file        *string
+}
+
+type connection struct {
+	userName    string
+	broadcastCh chan message
+}
+
+type message struct {
+	user string
+	body string
+	time time.Time
+}
+
+type supervisor struct {
+	userRegisterCh    chan connection
+	userUnregisterCh  chan string
+	users             map[string]connection
+	supervisorProcess func()
+	broadcastCh       chan message
 }
 
 func parseChannels(channels string) []channel {
@@ -63,52 +84,125 @@ func setupOptions() options {
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(
+	conn net.Conn,
+	userRegisterCh chan connection,
+	userUnregisterCh chan string,
+	serverBroadcastCh chan message,
+) {
+	conn.Write([]byte("tell me your name:\n"))
 	var name string = ""
 	defer conn.Close()
-	reader := bufio.NewReader(conn)
+	userBroadcastCh := make(chan message)
 	for {
-		message, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Println("Error reading data:", err)
-			break
+		select {
+		case message := <-userBroadcastCh:
+			fmt.Fprintf(conn, "%v:%v", message.user, message.body)
+		default:
+			reader := bufio.NewReader(conn)
+			messageBody, err := reader.ReadString('\n')
+			messageBody = strings.TrimSpace(messageBody)
+			if err != nil {
+				userUnregisterCh <- name
+				fmt.Println("Error reading data:", err)
+				break
+			}
+
+			if messageBody != "" && name != "" {
+				serverBroadcastCh <- message{
+					user: name,
+					body: messageBody,
+					time: time.Now(),
+				}
+			}
+
+			if messageBody == "" && name == "" {
+				fmt.Println(1)
+				conn.Write([]byte("tell me your name:\n"))
+			}
+			if messageBody == "server" && name == "" {
+				fmt.Println(2)
+				conn.Write([]byte("you can't be the server, sorry\n"))
+			}
+			if messageBody != "" && name == "" {
+				name = messageBody
+				userRegisterCh <- connection{
+					userName:    name,
+					broadcastCh: userBroadcastCh,
+				}
+			}
 		}
-		if name == "" && message == "" {
-			conn.Write([]byte("tell me your name"))
+	}
+}
+
+func createSupervisor() supervisor {
+	userRegisterCh := make(chan connection)
+	userUnregisterCh := make(chan string)
+	broadcastCh := make(chan message)
+
+	routine := func() {
+		users := map[string]struct{}{"server": {}}
+		userConnections := []connection{}
+
+		for {
+			select {
+			case user := <-userUnregisterCh:
+				fmt.Println(2)
+				delete(users, user)
+				log.Println("UNregistered user:", user)
+			case user := <-userRegisterCh:
+				fmt.Println(1)
+				users[user.userName] = struct{}{}
+				userConnections = append(userConnections, user)
+				user.broadcastCh <- message{
+					user: "server",
+					body: "welcome",
+				}
+				log.Println("registered user:", user.userName)
+			case message := <-broadcastCh:
+				fmt.Println(3)
+				log.Printf("received message with body %v to user %v", message.body, message.user)
+				for _, v := range userConnections {
+					if v.userName != message.user {
+						go func() {
+							v.broadcastCh <- message
+							log.Printf("send message with body %v to user %v", message.body, message.user)
+						}()
+					}
+				}
+			}
 		}
-		if name == "" && message != "" {
-			name = message
-		}
-		fmt.Printf("Received message: %#v", message)
-		conn.Write([]byte("ack:" + message))
+	}
+
+	return supervisor{
+		userRegisterCh:    userRegisterCh,
+		userUnregisterCh:  userUnregisterCh,
+		users:             map[string]connection{},
+		supervisorProcess: routine,
+		broadcastCh:       broadcastCh,
 	}
 }
 
 func main() {
 	opts := setupOptions()
+	superv := createSupervisor()
+
 	listener, err := net.Listen("tcp", opts.port)
 	if err != nil {
 		fmt.Println("Failed to listen on port:", err)
 		return
 	}
 	defer listener.Close()
+
 	fmt.Fprintf(os.Stderr, "Server is listening on port %v...\n", opts.port)
 
-	//userRegisterChan := make(chan string)
-
-	go func() {
-		//users := map[string]struct{}{}
-
-		//newUser := <-userRegisterChan
-
-	}()
-
+	go superv.supervisorProcess()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println("Failed to accept connection:", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConnection(conn, superv.userRegisterCh, superv.userUnregisterCh, superv.broadcastCh)
 	}
 }
