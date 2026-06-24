@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 )
@@ -94,43 +97,56 @@ func handleConnection(
 	var name string = ""
 	defer conn.Close()
 	userBroadcastCh := make(chan message)
+
+	sigch := make(chan os.Signal, 1)
+	signal.Notify(sigch, os.Interrupt)
 	for {
-		select {
-		case message := <-userBroadcastCh:
+		go func() {
+			message := <-userBroadcastCh
 			fmt.Fprintf(conn, "%v:%v", message.user, message.body)
-		default:
-			reader := bufio.NewReader(conn)
-			messageBody, err := reader.ReadString('\n')
-			messageBody = strings.TrimSpace(messageBody)
-			if err != nil {
-				userUnregisterCh <- name
-				fmt.Println("Error reading data:", err)
-				break
+		}()
+		go func() {
+			<-sigch
+			conn.Close()
+			os.Exit(0)
+		}()
+		reader := bufio.NewReader(conn)
+		messageBody, err := reader.ReadString('\n')
+		messageBody = strings.TrimSpace(messageBody)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				log.Printf("user \"%v\" disconnected\n", name)
+			} else {
+				log.Printf("error reading for user \"%v\" data: %v\n", name, err)
 			}
+			userUnregisterCh <- name
+			return
+		}
 
-			if messageBody != "" && name != "" {
-				serverBroadcastCh <- message{
-					user: name,
-					body: messageBody,
-					time: time.Now(),
-				}
+		if messageBody != "" && name != "" {
+			serverBroadcastCh <- message{
+				user: name,
+				body: messageBody + "\n",
+				time: time.Now(),
 			}
+		}
 
-			if messageBody == "" && name == "" {
-				fmt.Println(1)
-				conn.Write([]byte("tell me your name:\n"))
+		if messageBody == "" && name == "" {
+			conn.Write([]byte("tell me your name:\n"))
+		}
+		if messageBody == "server" && name == "" {
+			conn.Write([]byte("you can't be the server, sorry\n"))
+		}
+		if messageBody != "" && name == "" {
+			name = messageBody
+			userRegisterCh <- connection{
+				userName:    name,
+				broadcastCh: userBroadcastCh,
 			}
-			if messageBody == "server" && name == "" {
-				fmt.Println(2)
-				conn.Write([]byte("you can't be the server, sorry\n"))
-			}
-			if messageBody != "" && name == "" {
-				name = messageBody
-				userRegisterCh <- connection{
-					userName:    name,
-					broadcastCh: userBroadcastCh,
-				}
-			}
+			go func() {
+				message := <-userBroadcastCh
+				fmt.Fprintf(conn, "%v:%v", message.user, message.body)
+			}()
 		}
 	}
 }
@@ -147,26 +163,24 @@ func createSupervisor() supervisor {
 		for {
 			select {
 			case user := <-userUnregisterCh:
-				fmt.Println(2)
 				delete(users, user)
-				log.Println("UNregistered user:", user)
+				log.Printf("unregistered user: \"%v\"\n", user)
 			case user := <-userRegisterCh:
-				fmt.Println(1)
 				users[user.userName] = struct{}{}
 				userConnections = append(userConnections, user)
 				user.broadcastCh <- message{
 					user: "server",
-					body: "welcome",
+					body: "welcome " + user.userName + "\n",
+					time: time.Now(),
 				}
 				log.Println("registered user:", user.userName)
 			case message := <-broadcastCh:
-				fmt.Println(3)
-				log.Printf("received message with body %v to user %v", message.body, message.user)
+				log.Printf("received message with body %v from user %v", strings.TrimSpace(message.body), message.user)
 				for _, v := range userConnections {
 					if v.userName != message.user {
 						go func() {
 							v.broadcastCh <- message
-							log.Printf("send message with body %v to user %v", message.body, message.user)
+							log.Printf("send message with body %v to user %v", strings.TrimSpace(message.body), message.user)
 						}()
 					}
 				}
@@ -189,18 +203,17 @@ func main() {
 
 	listener, err := net.Listen("tcp", opts.port)
 	if err != nil {
-		fmt.Println("Failed to listen on port:", err)
-		return
+		log.Fatalln("Failed to listen on port:", err)
 	}
 	defer listener.Close()
 
-	fmt.Fprintf(os.Stderr, "Server is listening on port %v...\n", opts.port)
+	log.Printf("Server is listening on port %v...\n", opts.port)
 
 	go superv.supervisorProcess()
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Failed to accept connection:", err)
+			log.Println("Failed to accept connection:", err)
 			continue
 		}
 		go handleConnection(conn, superv.userRegisterCh, superv.userUnregisterCh, superv.broadcastCh)
